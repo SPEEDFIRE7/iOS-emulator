@@ -32,10 +32,9 @@ jobs:
       - name: Download IPSW
         run: |
           mkdir -p work && cd work
-          ipsw download ipsw \
+          yes | ipsw download ipsw \
             --device "${{ inputs.device }}" \
-            --version "${{ inputs.version }}" \
-            --yes
+            --version "${{ inputs.version }}"
           ls -lh *.ipsw
 
       - name: Extract dyld_shared_cache and kernelcache
