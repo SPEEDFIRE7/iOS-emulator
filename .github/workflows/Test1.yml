@@ -40,7 +40,23 @@ jobs:
       - name: Extract dyld_shared_cache and kernelcache
         working-directory: work
         run: |
-          ipsw extract --dyld --kernel --output extracted *.ipsw
+          # Kernelcache (works without root)
+          ipsw extract --kernel --output extracted *.ipsw || true
+
+          # Attempt 1: ipsw mounts the DMG itself (needs root for loop device)
+          if sudo "$(which ipsw)" extract --dyld --output extracted *.ipsw; then
+            sudo chown -R "$USER":"$USER" extracted
+          else
+            echo "Attempt 1 failed, falling back to 7z on the rootfs DMG"
+            sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+            mkdir -p dmgs dsc
+            unzip -o -q *.ipsw '*.dmg' -d dmgs
+            ls -lhS dmgs
+            ROOTFS=$(ls -S dmgs/*.dmg | head -1)
+            echo "Rootfs DMG: $ROOTFS"
+            7z x -y -odsc "$ROOTFS" '*dyld_shared_cache_arm64*' -r || true
+            find dsc -name 'dyld_shared_cache_arm64*' -exec cp -v {} extracted/ \;
+          fi
           find extracted -type f | head -50
           df -h /
 
