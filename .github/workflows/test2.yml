@@ -1,4 +1,4 @@
-name: Extract iOS 12 libs (iPhone 6) workflow Plus
+name: Extract iOS 12 libs (iPhone 6)
 
 on:
   workflow_dispatch:
@@ -14,6 +14,8 @@ jobs:
   extract:
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
@@ -71,8 +73,6 @@ jobs:
             echo "Full split OK"
           else
             echo "Full split failed, extracting key libraries one by one"
-            ipsw dyld extract "$DSC" --all --output libs \
-              || echo "--all not supported or failed"
             for lib in \
                 /usr/lib/libSystem.B.dylib \
                 /usr/lib/libobjc.A.dylib \
@@ -136,19 +136,39 @@ jobs:
           find libs-fixed -type f | wc -l
           du -sh libs-fixed
 
-      - name: List what was extracted
-        working-directory: work
+      - name: Build small text report (send me this one)
         run: |
+          gcc -O2 -o machoinfo machoinfo.c
+          cd work
           find libs libs-fixed -type f | sort > extracted-files.txt
-          head -100 extracted-files.txt
+          {
+            echo "=== SIZES ==="
+            du -sh libs libs-fixed 2>/dev/null
+            ls -lh libs-fixed 2>/dev/null
+            for d in libs-fixed libs; do
+              for f in $(find $d -type f | sort); do
+                echo; echo "################ $f"
+                ../machoinfo "$f" | head -40 || true
+              done
+            done
+          } > report.txt 2>&1
+          wc -c report.txt
+          head -80 report.txt
 
-      - name: Upload artifact
+      - name: Upload report (small)
         uses: actions/upload-artifact@v4
         with:
-          name: ios-${{ inputs.version }}-${{ inputs.device }}-libs
+          name: report
           path: |
-            work/libs
-            work/libs-fixed
+            work/report.txt
             work/cache-images.txt
             work/extracted-files.txt
+          retention-days: 7
+
+      - name: Upload libraries (large, optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ inputs.version }}-${{ inputs.device }}-libs-fixed
+          path: work/libs-fixed
+          compression-level: 9
           retention-days: 7
