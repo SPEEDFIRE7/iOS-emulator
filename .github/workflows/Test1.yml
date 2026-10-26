@@ -1,0 +1,80 @@
+name: Extract iOS 12 libs (iPhone 6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device identifier (iPhone 6 = iPhone7,2)"
+        default: "iPhone7,2"
+      version:
+        description: "iOS version (last for iPhone 6 = 12.5.7)"
+        default: "12.5.7"
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h /
+
+      - name: Install ipsw (blacktop)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo blacktop/ipsw \
+            --pattern '*linux_x86_64.deb' --dir /tmp/ipsw
+          sudo dpkg -i /tmp/ipsw/*.deb
+          ipsw version
+
+      - name: Download IPSW
+        run: |
+          mkdir -p work && cd work
+          ipsw download ipsw \
+            --device "${{ inputs.device }}" \
+            --version "${{ inputs.version }}" \
+            --yes
+          ls -lh *.ipsw
+
+      - name: Extract dyld_shared_cache and kernelcache
+        working-directory: work
+        run: |
+          ipsw extract --dyld --kernel --output extracted *.ipsw
+          find extracted -type f | head -50
+          df -h /
+
+      - name: Split dyld_shared_cache into dylibs
+        working-directory: work
+        run: |
+          DSC=$(find extracted -type f -name 'dyld_shared_cache_arm64*' ! -name '*.map' | head -1)
+          echo "DSC=$DSC"
+          mkdir -p libs
+          # Try full split first
+          if ipsw dyld split "$DSC" libs; then
+            echo "Full split OK"
+          else
+            echo "Full split failed, extracting key libraries one by one"
+            for lib in libSystem.B libobjc.A libdyld libsystem_kernel libsystem_c \
+                       libc++.1 libc++abi CoreFoundation Foundation \
+                       CoreGraphics QuartzCore UIKit; do
+              ipsw dyld extract "$DSC" "$lib" --output libs || echo "skip $lib"
+            done
+          fi
+          find libs -type f | wc -l
+          du -sh libs
+
+      - name: List what was extracted
+        working-directory: work
+        run: |
+          find libs -type f | sort > extracted-files.txt
+          head -100 extracted-files.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ inputs.version }}-${{ inputs.device }}-libs
+          path: |
+            work/libs
+            work/extracted-files.txt
+          retention-days: 7
