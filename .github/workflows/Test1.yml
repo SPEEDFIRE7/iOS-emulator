@@ -24,8 +24,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download --repo blacktop/ipsw \
-            --pattern '*linux_x86_64.deb' --dir /tmp/ipsw
-          sudo dpkg -i /tmp/ipsw/*.deb
+            --pattern 'ipsw_*_linux_x86_64.deb' --dir /tmp/ipsw
+          ls -l /tmp/ipsw
+          sudo dpkg -i /tmp/ipsw/ipsw_*_linux_x86_64.deb
           ipsw version
 
       - name: Download IPSW
