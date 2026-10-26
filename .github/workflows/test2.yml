@@ -1,0 +1,154 @@
+name: Extract iOS 12 libs (iPhone 6) workflow Plus
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device identifier (iPhone 6 = iPhone7,2)"
+        default: "iPhone7,2"
+      version:
+        description: "iOS version (last for iPhone 6 = 12.5.7)"
+        default: "12.5.7"
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h /
+
+      - name: Install ipsw (blacktop)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo blacktop/ipsw \
+            --pattern 'ipsw_*_linux_x86_64.deb' --dir /tmp/ipsw
+          ls -l /tmp/ipsw
+          sudo dpkg -i /tmp/ipsw/ipsw_*_linux_x86_64.deb
+          ipsw version
+
+      - name: Download IPSW
+        run: |
+          mkdir -p work && cd work
+          yes | ipsw download ipsw \
+            --device "${{ inputs.device }}" \
+            --version "${{ inputs.version }}"
+          ls -lh *.ipsw
+
+      - name: Extract dyld_shared_cache and kernelcache
+        working-directory: work
+        run: |
+          # Kernelcache (works without root)
+          ipsw extract --kernel --output extracted *.ipsw || true
+
+          # Attempt 1: ipsw mounts the DMG itself (needs root for loop device)
+          if sudo "$(which ipsw)" extract --dyld --output extracted *.ipsw; then
+            sudo chown -R "$USER":"$USER" extracted
+          else
+            echo "Attempt 1 failed, falling back to 7z on the rootfs DMG"
+            sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+            mkdir -p dmgs dsc
+            unzip -o -q *.ipsw '*.dmg' -d dmgs
+            ls -lhS dmgs
+            ROOTFS=$(ls -S dmgs/*.dmg | head -1)
+            echo "Rootfs DMG: $ROOTFS"
+            7z x -y -odsc "$ROOTFS" '*dyld_shared_cache_arm64*' -r || true
+            find dsc -name 'dyld_shared_cache_arm64*' -exec cp -v {} extracted/ \;
+          fi
+          find extracted -type f | head -50
+          df -h /
+
+      - name: Split dyld_shared_cache into dylibs
+        working-directory: work
+        run: |
+          DSC=$(find extracted -type f -name 'dyld_shared_cache_arm64*' ! -name '*.map' | head -1)
+          echo "DSC=$DSC"
+          mkdir -p libs
+          # Try full split first
+          if ipsw dyld split "$DSC" libs; then
+            echo "Full split OK"
+          else
+            echo "Full split failed, extracting key libraries one by one"
+            ipsw dyld extract "$DSC" --all --output libs \
+              || echo "--all not supported or failed"
+            for lib in \
+                /usr/lib/libSystem.B.dylib \
+                /usr/lib/libobjc.A.dylib \
+                /usr/lib/system/libdyld.dylib \
+                /usr/lib/system/libsystem_kernel.dylib \
+                /usr/lib/system/libsystem_c.dylib \
+                /usr/lib/system/libsystem_pthread.dylib \
+                /usr/lib/system/libdispatch.dylib \
+                /usr/lib/system/libxpc.dylib \
+                /usr/lib/system/libsystem_blocks.dylib \
+                /usr/lib/system/libsystem_platform.dylib \
+                /usr/lib/system/libcache.dylib \
+                /usr/lib/libc++.1.dylib \
+                /usr/lib/libc++abi.dylib \
+                /usr/lib/libz.1.dylib \
+                /usr/lib/libicucore.A.dylib \
+                /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation \
+                /System/Library/Frameworks/Foundation.framework/Foundation \
+                /System/Library/Frameworks/CoreGraphics.framework/CoreGraphics \
+                /System/Library/Frameworks/QuartzCore.framework/QuartzCore \
+                /System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore \
+                /System/Library/Frameworks/UIKit.framework/UIKit; do
+              ipsw dyld extract "$DSC" "$lib" --output libs \
+                || echo "SKIP $lib"
+            done
+          fi
+          find libs -type f | wc -l
+          du -sh libs
+
+      - name: Rebuild standalone dylibs (DyldExtractor)
+        working-directory: work
+        run: |
+          DSC=$(find extracted -type f -name 'dyld_shared_cache_arm64*' ! -name '*.map' | head -1)
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q dyldextractor
+          mkdir -p libs-fixed
+          dyldex -l "$DSC" > cache-images.txt || echo "image list failed"
+          wc -l cache-images.txt
+          for lib in \
+              /usr/lib/libSystem.B.dylib \
+              /usr/lib/libobjc.A.dylib \
+              /usr/lib/system/libdyld.dylib \
+              /usr/lib/system/libsystem_kernel.dylib \
+              /usr/lib/system/libsystem_c.dylib \
+              /usr/lib/system/libsystem_pthread.dylib \
+              /usr/lib/system/libdispatch.dylib \
+              /usr/lib/libc++.1.dylib \
+              /usr/lib/libc++abi.dylib \
+              /usr/lib/libz.1.dylib \
+              /usr/lib/libicucore.A.dylib \
+              /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation \
+              /System/Library/Frameworks/Foundation.framework/Foundation \
+              /System/Library/Frameworks/CoreGraphics.framework/CoreGraphics \
+              /System/Library/Frameworks/QuartzCore.framework/QuartzCore \
+              /System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore; do
+            n=$(basename "$lib")
+            dyldex -e "$lib" -o "libs-fixed/$n" "$DSC" \
+              || echo "SKIP $lib"
+          done
+          find libs-fixed -type f | wc -l
+          du -sh libs-fixed
+
+      - name: List what was extracted
+        working-directory: work
+        run: |
+          find libs libs-fixed -type f | sort > extracted-files.txt
+          head -100 extracted-files.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ inputs.version }}-${{ inputs.device }}-libs
+          path: |
+            work/libs
+            work/libs-fixed
+            work/cache-images.txt
+            work/extracted-files.txt
+          retention-days: 7
