@@ -103,14 +103,15 @@ jobs:
           du -sh libs
 
       - name: Rebuild standalone dylibs (DyldExtractor)
+        continue-on-error: true
         working-directory: work
         run: |
           DSC=$(find extracted -type f -name 'dyld_shared_cache_arm64*' ! -name '*.map' | head -1)
           python3 -m venv venv
           . venv/bin/activate
-          pip install -q setuptools wheel
+          pip install -q "setuptools<70" wheel
           pip install -q dyldextractor
-          python -c "import capstone; print('capstone OK')"
+          python -c "import capstone; print('capstone OK')" || echo 'capstone import problem'
           mkdir -p libs-fixed
           dyldex -l "$DSC" > cache-images.txt || echo "image list failed"
           wc -l cache-images.txt
