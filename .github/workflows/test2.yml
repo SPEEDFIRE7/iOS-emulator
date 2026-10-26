@@ -108,7 +108,9 @@ jobs:
           DSC=$(find extracted -type f -name 'dyld_shared_cache_arm64*' ! -name '*.map' | head -1)
           python3 -m venv venv
           . venv/bin/activate
+          pip install -q setuptools wheel
           pip install -q dyldextractor
+          python -c "import capstone; print('capstone OK')"
           mkdir -p libs-fixed
           dyldex -l "$DSC" > cache-images.txt || echo "image list failed"
           wc -l cache-images.txt
@@ -138,6 +140,105 @@ jobs:
 
       - name: Build small text report (send me this one)
         run: |
+          if [ ! -f machoinfo.c ]; then
+            cat > machoinfo.c <<'MACHOEOF'
+          /* machoinfo - inspect an arm64 Mach-O (iOS) file. Portable C, builds on Android/Termux/Linux.
+           * Usage: machoinfo FILE [-i]   (-i lists imported symbols with dylib ordinal)
+           * Step 1 of an iOS->Android loader: understand what a binary needs before mapping it. */
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+
+          #define MH_MAGIC_64 0xfeedfacf
+          #define LC_REQ_DYLD 0x80000000u
+          struct mh64 { uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved; };
+          struct lc { uint32_t cmd, cmdsize; };
+          struct seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize, fileoff, filesize;
+                         int32_t maxprot, initprot; uint32_t nsects, flags; };
+          struct sect64 { char sectname[16], segname[16]; uint64_t addr, size; uint32_t offset, align, reloff, nreloc, flags, r1, r2, r3; };
+          struct dylibc { uint32_t cmd, cmdsize, nameoff, timestamp, cur, compat; };
+          struct dyldinfo { uint32_t cmd, cmdsize, rebase_off, rebase_size, bind_off, bind_size,
+                            weak_off, weak_size, lazy_off, lazy_size, export_off, export_size; };
+          struct symtabc { uint32_t cmd, cmdsize, symoff, nsyms, stroff, strsize; };
+          struct entryc { uint32_t cmd, cmdsize; uint64_t entryoff, stacksize; };
+          struct ledata { uint32_t cmd, cmdsize, dataoff, datasize; };
+
+          static const char *ftype(uint32_t t){switch(t){case 1:return"OBJECT";case 2:return"EXECUTE";case 6:return"DYLIB";case 7:return"DYLINKER";case 8:return"BUNDLE";default:return"?";}}
+
+          static uint64_t uleb(const uint8_t **p){uint64_t r=0;int s=0;uint8_t b;do{b=*(*p)++;r|=(uint64_t)(b&0x7f)<<s;s+=7;}while(b&0x80);return r;}
+
+          static void list_binds(const uint8_t *d, uint32_t size, const char *kind, char (*dylibs)[256], int ndylibs){
+              const uint8_t *p=d,*end=d+size; int ord=0; char sym[512]=""; int n=0;
+              while(p<end){
+                  uint8_t b=*p++, op=b&0xf0, imm=b&0x0f;
+                  switch(op){
+                  case 0x00: break;
+                  case 0x10: ord=imm; break;
+                  case 0x20: ord=(int)uleb(&p); break;
+                  case 0x30: ord=-(int)(imm?(0x10-imm):0); break; /* special: 0 self, -1 main, -2 flat */
+                  case 0x40: { size_t i=0; while(*p&&i<sizeof(sym)-1) sym[i++]=*p++; sym[i]=0; p++; break; }
+                  case 0x50: break;
+                  case 0x60: { while(*p++&0x80); break; }
+                  case 0x70: uleb(&p); break;
+                  case 0x80: uleb(&p); break;
+                  case 0x90: case 0xa0: case 0xb0: case 0xc0:
+                      if(op==0xa0) uleb(&p); else if(op==0xc0){uleb(&p);uleb(&p);}
+                      { const char *dn = (ord>0 && ord<=ndylibs)? dylibs[ord-1] : (ord==0?"(self)":ord==-1?"(main)":"(flat)");
+                        const char *base=strrchr(dn,'/'); printf("  [%s] %-40s <- %s\n",kind,sym,base?base+1:dn); n++; }
+                      break;
+                  default: break;
+                  }
+              }
+              (void)n;
+          }
+
+          int main(int argc,char**argv){
+              if(argc<2){fprintf(stderr,"usage: %s FILE [-i]\n",argv[0]);return 1;}
+              int imports = argc>2 && !strcmp(argv[2],"-i");
+              FILE*f=fopen(argv[1],"rb"); if(!f){perror("open");return 1;}
+              fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+              uint8_t*buf=malloc(sz); if(fread(buf,1,sz,f)!=(size_t)sz){perror("read");return 1;} fclose(f);
+              struct mh64*h=(struct mh64*)buf;
+              if(h->magic!=MH_MAGIC_64){fprintf(stderr,"Not a thin 64-bit Mach-O (magic %08x)\n",h->magic);return 1;}
+              printf("File: %s (%ld bytes)\nType: %s  cpu: 0x%x  flags: 0x%x  ncmds: %u\n\n",argv[1],sz,ftype(h->filetype),h->cputype,h->flags,h->ncmds);
+              static char dylibs[256][256]; int nd=0;
+              struct dyldinfo di={0}; int have_di=0;
+              const uint8_t*p=buf+sizeof(*h);
+              printf("Segments:\n");
+              for(uint32_t i=0;i<h->ncmds;i++){
+                  struct lc*c=(struct lc*)p;
+                  switch(c->cmd){
+                  case 0x19:{ struct seg64*s=(struct seg64*)p;
+                      printf("  %-16s vm=0x%09llx size=0x%08llx file=0x%08llx+0x%llx prot=%d/%d sects=%u\n",s->segname,
+                        (unsigned long long)s->vmaddr,(unsigned long long)s->vmsize,(unsigned long long)s->fileoff,(unsigned long long)s->filesize,s->initprot,s->maxprot,s->nsects);
+                      break;}
+                  case 0xc: case 0x80000018: case 0x8000001f: case 0xd:{ struct dylibc*d=(struct dylibc*)p;
+                      const char*name=(const char*)p+d->nameoff;
+                      if(c->cmd==0xd) printf("\nInstall name: %s\n",name);
+                      else { if(nd<256) strncpy(dylibs[nd++],name,255);
+                             if(nd==1) printf("\nDependencies:\n");
+                             printf("  %2d. %s%s\n",nd,name,c->cmd==0x8000001f?"  (re-export)":c->cmd==0x80000018?"  (weak)":""); }
+                      break;}
+                  case 0x22: case 0x80000022: di=*(struct dyldinfo*)p; have_di=1; break;
+                  case 0x80000034: printf("\n!! Uses chained fixups (iOS 15+ style) - loader needs that decoder\n"); break;
+                  case 0x80000028:{ struct entryc*e=(struct entryc*)p; printf("\nEntry (LC_MAIN) offset: 0x%llx\n",(unsigned long long)e->entryoff); break;}
+                  case 5: printf("\nEntry via LC_UNIXTHREAD\n"); break;
+                  case 0x25: printf("\nMin iOS version load command present (LC_VERSION_MIN_IPHONEOS)\n"); break;
+                  case 0x2: { struct symtabc*s=(struct symtabc*)p; printf("\nSymtab: %u symbols\n",s->nsyms); break;}
+                  }
+                  p+=c->cmdsize;
+              }
+              if(have_di){
+                  printf("\nDyld info: rebase=%u B, bind=%u B, weak=%u B, lazy=%u B, exports=%u B\n",di.rebase_size,di.bind_size,di.weak_size,di.lazy_size,di.export_size);
+                  if(imports){ printf("\nImports:\n");
+                      if(di.bind_size) list_binds(buf+di.bind_off,di.bind_size,"bind",dylibs,nd);
+                      if(di.lazy_size) list_binds(buf+di.lazy_off,di.lazy_size,"lazy",dylibs,nd); }
+              }
+              return 0;
+          }
+          MACHOEOF
+          fi
           gcc -O2 -o machoinfo machoinfo.c
           cd work
           find libs libs-fixed -type f | sort > extracted-files.txt
