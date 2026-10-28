@@ -477,4 +477,9 @@ jobs:
 
       - name: رفع سجل البناء
         if: always()
-        uses: actions/upload-
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
